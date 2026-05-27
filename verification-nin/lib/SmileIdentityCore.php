@@ -1,0 +1,503 @@
+<?php
+
+namespace SmileIdentity;
+
+require_once __DIR__ . '/Signature.php';
+require_once 'utils.php';
+
+use Exception;
+use ZipArchive;
+use DateTimeInterface;
+use GuzzleHttp\Client;
+use Ouzo\Utilities\Clock;
+use GuzzleHttp\Psr7\Utils;
+use GuzzleHttp\Exception\RequestException;
+
+const DEFAULT_JOB_STATUS_SLEEP = 2;
+const default_options = [
+    'optional_callback' => '',
+    'return_job_status' => false,
+    'return_history' => false,
+    'return_image_links' => false,
+    'signature' => false,
+    'user_async' => false,
+];
+
+class SmileIdentityCore
+{
+    public Signature $sig_class;
+    private string $partner_id;
+    private string $api_key;
+    private string $default_callback;
+    private string $sid_server;
+    private Client $client;
+
+    /**
+     * WebApi constructor.
+     * @param $partner_id
+     * @param $default_callback
+     * @param $api_key
+     * @param $sid_server
+     * @throws Exception
+     */
+    public function __construct(string $partner_id, string $default_callback, string $api_key, string $sid_server)
+    {
+        $this->partner_id = $partner_id;
+        $this->api_key = $api_key;
+        $this->default_callback = $default_callback;
+        $this->sig_class = new Signature($partner_id, $api_key);
+        if (strlen($sid_server) == 1) {
+            if (intval($sid_server) < 2) {
+                $this->sid_server = Config::SID_SERVERS[intval($sid_server)];
+            } else {
+                throw new \Exception("Invalid server selected");
+            }
+        } else {
+            $this->sid_server = $sid_server;
+        }
+        $this->client = new Client(['base_uri' => $this->sid_server]);
+    }
+
+    public function get_version(): string
+    {
+        return Config::VERSION;
+    }
+
+    /**
+     * Generates signature based current timestamp
+     * @return array
+     */
+    public function generate_signature(): array
+    {
+        return $this->sig_class->generate_signature();
+    }
+
+    /**
+     * @param array $partner_params a key-value pair object containing partner's specified parameters
+     * @param array $image_details a key-value pair object containing details for each image to be uploaded along with the job
+     * @param array $id_info a key-value pair object containing user's specified ID information
+     * @param array $options a key-value pair object containing additional, optional parameters
+     * @throws GuzzleException
+     * @throws Exception
+     */
+    public function submit_job($partner_params, $image_details, $id_info, $_options)
+    {
+        validatePartnerParams($partner_params);
+
+        $job_type = $partner_params['job_type'];
+
+        validateIdParams($id_info, $job_type);
+
+        $options = $this->getOptions($_options);
+
+        if ($job_type === JobType::ENHANCED_KYC) {
+            $id_api = new IdApi($this->partner_id, $this->default_callback, $this->api_key, $this->sid_server);
+            return $id_api->submit_job($partner_params, $id_info, $options);
+        }
+
+        validateJobTypes(array(
+            JobType::BIOMETRIC_KYC,
+            JobType::BUSINESS_VERIFICATION,
+            JobType::DOCUMENT_VERIFICATION,
+            JobType::ENHANCED_DOCUMENT_VERIFICATION,
+            JobType::SMART_SELFIE_AUTHENTICATION,
+            JobType::SMART_SELFIE_REGISTRATION,
+        ), $job_type);
+
+        if ($job_type === JobType::BUSINESS_VERIFICATION) {
+            return $this->submit_kyb_job($partner_params, $id_info);
+        }
+
+        validateImageParams($image_details, $job_type, key_exists('use_enrolled_image', $options) && $options['use_enrolled_image']);
+        validateOptions($options);
+
+        $signature_params = $this->sig_class->generate_signature();
+        $response_body = $this->call_prep_upload($partner_params, $options, $signature_params);
+        $code = array_value_by_key('code', $response_body);
+        if ($code != '2202') {
+            $message = array_value_by_key('error', $response_body);
+            if (!$message) {
+                $message = array_value_by_key('message', $response_body);
+            }
+            throw new Exception($message);
+        }
+
+        $upload_url = $response_body['upload_url'];
+        $smile_job_id = $response_body['smile_job_id'];
+        $file_path = $this->generate_zip_file($response_body, $id_info, $image_details, $partner_params, $signature_params, $options);
+        $response = $this->upload_file($upload_url, $file_path);
+
+        if ($response["statusCode"] != 200) {
+            throw new Exception("Failed to upload zip. status code: {$response["statusCode"]}");
+        }
+
+        if ($options['return_job_status']) {
+            $result = $this->poll_job_status($partner_params, $options);
+        } else {
+            $result = ['success' => true, "smile_job_id" => $smile_job_id];
+        }
+        return $result;
+    }
+
+    /**
+     * Gets the status of a specific job
+     * @param array $partner_params a key-value pair object containing partner's specified parameters
+     * @param array $options a key-value pair object containing additional, optional parameters
+     * @return array
+     * @throws GuzzleException
+     * @throws Exception
+     */
+    public function query_job_status($partner_params, $options): array
+    {
+        $signature_params = $this->sig_class->generate_signature();
+
+        $data = [
+            'user_id' => $partner_params['user_id'],
+            'job_id' => $partner_params['job_id'],
+            'partner_id' => $this->partner_id,
+            'image_links' => $options['return_image_links'],
+            'history' => $options['return_history'],
+            'source_sdk' => Config::SDK_CLIENT,
+            'source_sdk_version' => Config::VERSION
+        ];
+        $data = array_merge($data, $signature_params);
+
+        $json_data = json_encode($data, JSON_PRETTY_PRINT);
+
+        $client = $this->getClient();
+        $resp = $client->post('job_status', ['content-type' => 'application/json', 'body' => $json_data]);
+        $result = json_decode($resp->getBody()->getContents(), true);
+        $valid = $this->sig_class->confirm_signature($result['timestamp'], $result['signature']);
+
+        if (!$valid) {
+            throw new Exception("Unable to confirm validity of the job_status response");
+        }
+
+        return $result;
+    }
+    
+    /**
+     * Queries the list of Smile ID services
+     * @return array
+     * @throws GuzzleException
+     * @throws Exception
+     */
+    public function query_smile_id_services(): array
+    {
+        try {
+            $resp = $this->client->get('services',
+                [
+                    'content-type' => 'application/json'
+                ]
+            );
+
+            $status_code = $resp->getStatusCode();
+            $resp_result = $resp->getBody()->getContents();
+
+            if ($status_code !== 200) {
+                $msg = "Failed to get entity from {$this->sid_server}/services, response={statusCode}:{$resp->getReasonPhrase()} - {$resp_result}";
+                throw new Exception($msg);
+            }
+
+            return json_decode($resp_result, true);
+        } catch (RequestException $e) {
+            $resp = $e->getResponse();
+            $result = json_decode($resp->getReasonPhrase, true);
+            $result['statusCode'] = $resp->getStatusCode();
+            return $result;
+        }
+    }
+
+    /**
+     * Gets the status of a specific job
+     * @param array $partner_params a key-value pair object containing partner's specified parameters
+     * @param array $options a key-value pair object containing additional, optional parameters
+     * @return mixed
+     * @throws GuzzleException
+     */
+    public function get_job_status($partner_params, $options)
+    {
+        return $this->query_job_status($partner_params, $options);
+    }
+
+    /***
+     * Queries the backend for web session token with a specific timestamp
+     * @param timestamp the timestamp to generate the token from
+     * @param user_id
+     * @param job_id
+     * @param product_type - Literal value of any of the 6 product type options
+     * @return array
+     * @throws GuzzleException
+     */
+    public function get_web_token($user_id, $job_id, $product_type, $timestamp = null, $callback_url = null): array
+    {
+        $timestamp = $timestamp != null ? $timestamp : Clock::now()->getTimestamp();;
+        $signature = $this->sig_class->generate_signature(date(DateTimeInterface::ATOM, $timestamp));
+        
+        $data = [
+            'timestamp' => $signature["timestamp"],
+            'callback_url' => $callback_url != null ? $callback_url : $this->default_callback,
+            'partner_id' => $this->partner_id,
+            'user_id' => $user_id,
+            'job_id' => $job_id,
+            'product' => $product_type,
+            'signature' => $signature["signature"],
+            'source_sdk' => Config::SDK_CLIENT,
+            'source_sdk_version' => Config::VERSION
+        ];
+
+        $json_data = json_encode($data, JSON_PRETTY_PRINT);
+
+        try {
+            $resp = $this->client->post('token',
+                [
+                    'content-type' => 'application/json',
+                    'body' => $json_data
+                ]
+            );
+            return json_decode($resp->getBody()->getContents(), true);
+        } catch (RequestException $e) {
+            $resp = $e->getResponse();
+            $result = json_decode($resp->getBody()->getContents(), true);
+            $result['statusCode'] = $resp->getStatusCode();
+            return $result;
+        }
+    }
+
+    private function configure_image_payload($image_details): array
+    {
+        $images_json = [];
+        foreach ($image_details as $image) {
+            if (endsWith($image["image"], '.png')
+                || endsWith($image["image"], '.jpg')
+                || endsWith($image["image"], '.jpeg')) {
+                array_push($images_json, [
+                    "image_type_id" => $image["image_type_id"],
+                    "image" => "",
+                    "file_name" => basename($image["image"]),
+                ]);
+            } else {
+                array_push($images_json, [
+                    "image_type_id" => $image["image_type_id"],
+                    "file_name" => "",
+                    "image" => $image["image"],
+                ]);
+            }
+        }
+        return $images_json;
+    }
+
+    /**
+     * @param $partner_params
+     * @param $options
+     * @param $signature_params
+     * @return array
+     * @throws GuzzleException
+     */
+    private function call_prep_upload($partner_params, $options, $signature_params): array
+    {
+        $callback = $options['optional_callback'];
+        $job_type = $partner_params['job_type'];
+
+        $data = [
+            'callback_url' => $callback,
+            'file_name' => 'selfie.zip',
+            'model_parameters' => '',
+            'partner_params' => $partner_params,
+            'smile_client_id' => $this->partner_id,
+            'source_sdk' => Config::SDK_CLIENT,
+            'source_sdk_version' => Config::VERSION
+        ];
+
+        $data = array_merge($signature_params, $data);
+        if ($job_type == 6 && key_exists('use_enrolled_image', $options)) {
+            $data = array_merge($data, ['use_enrolled_image' => $options['use_enrolled_image']]);
+        }
+
+        $json_data = json_encode($data, JSON_PRETTY_PRINT);
+
+        try {
+            $resp = $this->client->post('upload',
+                [
+                    'content-type' => 'application/json',
+                    'body' => $json_data
+                ]
+            );
+            return json_decode($resp->getBody()->getContents(), true);
+        } catch (RequestException $e) {
+            $resp = $e->getResponse();
+            $result = json_decode($resp->getBody()->getContents(), true);
+            $result['statusCode'] = $resp->getStatusCode();
+            return $result;
+        }
+    }
+
+    /**
+     * @param $upload_url
+     * @param $filename
+     * @throws GuzzleException
+     */
+    private function upload_file($upload_url, $filename)
+    {
+        $body = Utils::tryFopen($filename, 'r');
+        $resp = $this->getClient()->request('PUT', $upload_url, ['body' => $body, 'headers' => [
+            'Content-Type' => 'application/zip',
+        ]]);
+
+        unlink($filename);
+        $result = json_decode($resp->getBody()->getContents(), true);
+        $result["statusCode"] = $resp->getStatusCode();
+        return $result;
+    }
+
+    /**
+     * @param $prep_upload_response_array
+     * @param $id_info
+     * @param $images
+     * @param $partner_params
+     * @param $signature_params
+     * @param $options
+     * @return array
+     */
+    private function configure_info_json($prep_upload_response_array, $id_info, $images, $partner_params, $signature_params, $options)
+    {
+        $callback = $options['optional_callback'];
+        $misc = [
+            "retry" => "false",
+            "partner_params" => $partner_params,
+            "file_name" => "selfie.zip",
+            "smile_client_id" => $this->partner_id,
+            "callback_url" => $callback,
+            "userData" => [
+                "isVerifiedProcess" => false,
+                "name" => "",
+                "fbUserID" => "",
+                "firstName" => "",
+                "lastName" => "",
+                "gender" => "",
+                "email" => "",
+                "phone" => "",
+                "countryCode" => "+",
+                "countryName" => ""
+            ]
+            ];
+        $misc = array_merge($misc, $signature_params);
+
+        return [
+            "package_information" => [
+                "apiVersion" => [
+                    "buildNumber" => 0,
+                    "majorVersion" => 2,
+                    "minorVersion" => 0
+                ],
+                "language" => "php"
+            ],
+            "misc_information" => $misc,
+            "id_info" => $id_info,
+            "images" => $this->configure_image_payload($images),
+            "server_information" => $prep_upload_response_array
+        ];
+    }
+
+    /**
+     */
+    private function generate_zip_file($response_body, $id_info, $images_info, $partner_params, $signature_params, $options): string
+    {
+        $info_json = $this->configure_info_json($response_body, $id_info, $images_info, $partner_params, $signature_params, $options);
+        $file = tempnam(sys_get_temp_dir(), "selfie");
+        $zip = new ZipArchive();
+
+        // Zip will open and overwrite the file, rather than try to read it.
+        $res = $zip->open($file, ZipArchive::OVERWRITE);
+        if ($res === TRUE) {
+            $zip->addFromString('info.json', json_encode($info_json, JSON_PRETTY_PRINT));
+            foreach ($images_info as $image) {
+                if (endsWith($image["image"], '.png')
+                    || endsWith($image["image"], '.jpg')
+                    || endsWith($image["image"], '.jpeg')) {
+                    $zip->addFile($image["image"], basename($image["image"]));
+                }
+            }
+            $zip->close();
+        }
+        return $file;
+    }
+
+    /**
+     * @param $_options
+     * @return array
+     */
+    private function getOptions($_options): array
+    {
+        $options = array_merge(default_options, $_options);
+        if ($options['optional_callback'] == null || strlen($options["optional_callback"]) == 0) {
+            $options["optional_callback"] = $this->default_callback;
+        }
+        return $options;
+    }
+
+    /**
+     * Submits business verification jobs
+     * @param array $partner_params a key-value pair object containing partner's specified parameters
+     * @param array $id_info a key-value pair object containing user's specified ID information
+     * @return ResponseInterface
+     * @throws GuzzleException
+     * @throws Exception
+     */
+    private function submit_kyb_job($partner_params, $id_info)
+    {
+        $signature_params = $this->sig_class->generate_signature();
+        $data = [
+            'partner_params' => $partner_params,
+            'partner_id' => $this->partner_id,
+            'source_sdk' => Config::SDK_CLIENT,
+            'source_sdk_version' => Config::VERSION
+        ];
+        $data = array_merge($data, $id_info, $signature_params);
+        $json_data = json_encode($data, JSON_PRETTY_PRINT);
+
+        $resp = $this->client->post('business_verification', [
+            'content-type' => 'application/json',
+            'body' => $json_data
+        ]);
+        $contents = $resp->getBody()->getContents();
+        return json_decode($contents, true);
+    }
+
+    /**
+     * @param $partner_params
+     * @param array $options
+     * @param array $response
+     * @param $smile_job_id
+     * @return array
+     * @throws GuzzleException
+     */
+    private function poll_job_status($partner_params, array $options): array
+    {
+        for ($i = 1; $i <= 20; $i += 1) {
+            sleep(DEFAULT_JOB_STATUS_SLEEP);
+            $result = $this->query_job_status($partner_params, $options);
+            if ($result['job_complete'] == true) {
+                $result['success'] = true;
+                break;
+            }
+        }
+        return $result;
+    }
+
+    /**
+     * @return Client
+     */
+    public function getClient(): Client
+    {
+        return $this->client;
+    }
+
+    /**
+     * @param Client $client
+     */
+    public function setClient(Client $client): void
+    {
+        $this->client = $client;
+    }
+}
